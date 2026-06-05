@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--font-sans,sans-serif);background:var(--color-background-tertiary);color:var(--color-text-primary);font-size:14px}
@@ -331,8 +332,36 @@ tr:hover td{background:var(--color-background-secondary)}
 <div id="toast" class="toast"></div>
 
 <script>
+// ── Supabase 연결 ─────────────────────────────────────────────
+const SUPABASE_URL = 'https://klnigpqubwnpdqnmbmym.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_Q40DB1OOyTNHSSZr9LqJ5A_VeCJBTj4';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+async function dbSave(date, channelId, payload) {
+  const { error } = await sb.from('sales').upsert(
+    { date, channel_id: channelId, ...payload },
+    { onConflict: 'date,channel_id' }
+  );
+  if (error) console.error('저장 오류:', error);
+}
+
+async function dbLoad(date) {
+  const { data, error } = await sb.from('sales').select('*').eq('date', date);
+  if (error) { console.error('불러오기 오류:', error); return {}; }
+  const result = {};
+  (data || []).forEach(r => {
+    result[r.channel_id] = { rev: r.rev, ord: r.ord, cancel: r.cancel, memo: r.memo, zero: r.zero };
+  });
+  return result;
+}
+
+async function dbLoadRange(startDate, endDate) {
+  const { data, error } = await sb.from('sales').select('*').gte('date', startDate).lte('date', endDate);
+  if (error) { console.error('불러오기 오류:', error); return []; }
+  return data || [];
+}
+
 // ── 데이터 구조 ──────────────────────────────────────────────
-// TODO: 웹서버 이전 시 이 부분을 DB API 호출로 교체하세요.
 
 const CB={삼성:'bs',원스킨:'bo',쎄이:'bse'};
 const CC={삼성:'#378ADD',원스킨:'#1D9E75',쎄이:'#EF9F27'};
@@ -541,17 +570,24 @@ function renderInputTable(){
   }).join('');
 }
 
-function saveAllInput(){
-  const date=document.getElementById('input-date').value||getToday();
-  if(!salesData[date]) salesData[date]={};
-  document.querySelectorAll('#input-tbody input').forEach(inp=>{
-    const id=inp.dataset.id;
-    const field=inp.dataset.field;
-    if(!salesData[date][id]) salesData[date][id]={rev:0,ord:0,cancel:0,memo:'',zero:false};
-    const val=field==='memo'?inp.value:parseInt(inp.value)||0;
-    salesData[date][id][field]=val;
-    if(field==='rev') salesData[date][id].zero=(val===0);
+async function saveAllInput(){
+  const date = document.getElementById('input-date').value || getToday();
+  if (!salesData[date]) salesData[date] = {};
+  const saves = [];
+  document.querySelectorAll('#input-tbody input').forEach(inp => {
+    const id = inp.dataset.id;
+    const field = inp.dataset.field;
+    if (!salesData[date][id]) salesData[date][id] = { rev:0, ord:0, cancel:0, memo:'', zero:false };
+    const val = field === 'memo' ? inp.value : parseInt(inp.value) || 0;
+    salesData[date][id][field] = val;
+    if (field === 'rev') salesData[date][id].zero = (val === 0);
   });
+  // DB 저장
+  const savePromises = CHANNELS.map(c => {
+    const e = salesData[date][c.id];
+    if (e) return dbSave(date, c.id, e);
+  }).filter(Boolean);
+  await Promise.all(savePromises);
   renderInputTable();
   renderDashboard();
   toast('저장 완료!');
@@ -573,17 +609,19 @@ function openChModal(chId,date){
   document.getElementById('modal-bg').style.display='flex';
 }
 function closeModal(){document.getElementById('modal-bg').style.display='none';}
-function saveModal(){
-  const date=modalDate;const id=modalChId;
-  if(!salesData[date]) salesData[date]={};
-  const rev=parseInt(document.getElementById('m-rev').value)||0;
-  salesData[date][id]={
-    rev,ord:parseInt(document.getElementById('m-ord').value)||0,
-    cancel:parseInt(document.getElementById('m-cancel').value)||0,
-    memo:document.getElementById('m-memo').value,
-    zero:rev===0
+async function saveModal(){
+  const date = modalDate; const id = modalChId;
+  if (!salesData[date]) salesData[date] = {};
+  const rev = parseInt(document.getElementById('m-rev').value) || 0;
+  const payload = {
+    rev, ord: parseInt(document.getElementById('m-ord').value) || 0,
+    cancel: parseInt(document.getElementById('m-cancel').value) || 0,
+    memo: document.getElementById('m-memo').value,
+    zero: rev === 0
   };
-  closeModal();renderDashboard();toast('저장 완료!');
+  salesData[date][id] = payload;
+  await dbSave(date, id, payload);
+  closeModal(); renderDashboard(); toast('저장 완료!');
 }
 
 // ── 채널별 판매 ───────────────────────────────────────────────
@@ -894,10 +932,32 @@ document.getElementById('alert-list').innerHTML=ALERTS.map(a=>`
   </div>`).join('');
 
 // ── 초기화 ───────────────────────────────────────────────────
-document.getElementById('input-date').value=getToday();
-document.getElementById('input-date').addEventListener('change',renderInputTable);
-renderDashboard();
-filterInq('all');
+document.getElementById('input-date').value = getToday();
+document.getElementById('input-date').addEventListener('change', async () => {
+  const date = document.getElementById('input-date').value;
+  if (!salesData[date]) {
+    toast('데이터 불러오는 중...');
+    salesData[date] = await dbLoad(date);
+  }
+  renderInputTable();
+});
+
+(async () => {
+  // 오늘 + 최근 30일 데이터 DB에서 로드
+  const today = getToday();
+  const start = getPastDate(29);
+  toast('데이터 불러오는 중...');
+  const rows = await dbLoadRange(start, today);
+  if (rows.length > 0) {
+    // DB 데이터가 있으면 샘플 덮어쓰기
+    rows.forEach(r => {
+      if (!salesData[r.date]) salesData[r.date] = {};
+      salesData[r.date][r.channel_id] = { rev: r.rev, ord: r.ord, cancel: r.cancel, memo: r.memo, zero: r.zero };
+    });
+  }
+  renderDashboard();
+  filterInq('all');
+})();
 </script>
 </body>
 </html>
